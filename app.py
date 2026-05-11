@@ -69,6 +69,21 @@ SECTOR_ETF = {
     "Utilities": "XLU",
 }
 
+SECTOR_HE = {
+    "Information Technology": "טכנולוגיה",
+    "Communication Services": "תקשורת ושירותי מדיה",
+    "Consumer Discretionary": "צריכה מחזורית",
+    "Consumer Staples": "צריכה בסיסית",
+    "Energy": "אנרגיה",
+    "Financials": "פיננסים",
+    "Health Care": "בריאות",
+    "Industrials": "תעשייה",
+    "Materials": "חומרי גלם",
+    "Real Estate": "נדל\"ן",
+    "Utilities": "תשתיות",
+    "Unknown": "לא ידוע",
+}
+
 
 def normalize_symbol(sym: str) -> str:
     # Yahoo uses BRK-B instead of BRK.B
@@ -99,6 +114,8 @@ class SignalResult:
     reasons: List[str]
     avoid_if: List[str]
     backtest: dict
+    industry: Optional[str] = None
+    company_summary: str = ""
     next_earnings: Optional[str] = None
 
 
@@ -213,6 +230,29 @@ def get_next_earnings(symbol: str) -> Optional[str]:
         return min(future).strftime("%Y-%m-%d")
     except Exception:
         return None
+
+
+@st.cache_data(ttl=60 * 60 * 24, show_spinner=False)
+def get_company_profile(symbol: str, company: str, sector: str) -> Tuple[Optional[str], str]:
+    """Return a short, readable company profile for the UI.
+
+    This is intentionally lightweight: it enriches only top candidates, so the scan remains simple.
+    """
+    sector_he = SECTOR_HE.get(sector, sector or "לא ידוע")
+    industry = None
+    try:
+        info = yf.Ticker(symbol).info or {}
+        industry = info.get("industry") or info.get("industryDisp") or info.get("category")
+    except Exception:
+        industry = None
+
+    if industry:
+        summary = f"{company} היא חברה בסקטור {sector_he} ({sector}), בתחום פעילות: {industry}."
+    elif sector and sector != "Unknown":
+        summary = f"{company} היא חברה בסקטור {sector_he} ({sector})."
+    else:
+        summary = f"{company} היא חברה הנכללת במדד S&P 500. לא התקבל מידע סקטוריאלי מלא ממקור הנתונים."
+    return industry, summary
 
 
 # -----------------------------
@@ -762,6 +802,9 @@ def scan() -> Tuple[List[SignalResult], str, bool]:
     candidates.sort(key=lambda x: x.score, reverse=True)
     checked: List[SignalResult] = []
     for c in candidates[:15]:
+        industry, summary = get_company_profile(c.symbol, c.company, c.sector)
+        c.industry = industry
+        c.company_summary = summary
         ed = get_next_earnings(c.symbol)
         c.next_earnings = ed
         if ed:
@@ -808,14 +851,88 @@ def fmt_r(x: Optional[float]) -> str:
     return f"{x:.2f}R"
 
 
+def ltr(value: str) -> str:
+    """Keep English tickers, numbers and dollar amounts visually stable inside Hebrew text."""
+    return f"<span class='ltr'>{value}</span>"
+
+
+def bullet(text: str) -> None:
+    st.markdown(f"<div class='rtl-bullet'>• {text}</div>", unsafe_allow_html=True)
+
+
 st.markdown(
     """
     <style>
-    .main {direction: rtl; text-align: right;}
-    .stButton button {font-size: 1.15rem; font-weight: 700; border-radius: 16px; padding: 0.75rem 1.25rem; width: 100%;}
-    div[data-testid="stMetric"] {background: #ffffff; padding: 16px; border-radius: 18px; border: 1px solid #eee;}
-    .small-note {font-size: 0.9rem; color: #666; line-height: 1.7;}
-    .stock-card {border: 1px solid #e6e6e6; padding: 18px; border-radius: 20px; background: white; margin-bottom: 14px;}
+    html, body, .stApp, .main, .block-container, [data-testid="stAppViewContainer"], [data-testid="stMarkdownContainer"] {
+        direction: rtl !important;
+        text-align: right !important;
+    }
+    .block-container {
+        padding-top: 1.5rem;
+    }
+    .stButton button {
+        font-size: 1.15rem;
+        font-weight: 700;
+        border-radius: 16px;
+        padding: 0.75rem 1.25rem;
+        width: 100%;
+    }
+    div[data-testid="stMetric"] {
+        background: #ffffff;
+        padding: 14px;
+        border-radius: 18px;
+        border: 1px solid #eee;
+        direction: rtl !important;
+        text-align: right !important;
+    }
+    div[data-testid="stMetricValue"] {
+        direction: ltr !important;
+        unicode-bidi: isolate !important;
+        text-align: right !important;
+    }
+    div[data-testid="stMetricLabel"] {
+        direction: rtl !important;
+        text-align: right !important;
+    }
+    details summary, div[data-testid="stExpander"] details summary {
+        direction: rtl !important;
+        text-align: right !important;
+    }
+    .small-note {
+        font-size: 0.9rem;
+        color: #666;
+        line-height: 1.7;
+        direction: rtl;
+        text-align: right;
+    }
+    .company-box {
+        background: #f7f7fb;
+        border: 1px solid #e7e7ef;
+        border-radius: 18px;
+        padding: 14px 16px;
+        margin: 8px 0 18px 0;
+        line-height: 1.85;
+        direction: rtl;
+        text-align: right;
+    }
+    .rtl-line {
+        direction: rtl;
+        text-align: right;
+        line-height: 1.9;
+        margin-bottom: 0.45rem;
+    }
+    .rtl-bullet {
+        direction: rtl;
+        text-align: right;
+        line-height: 1.9;
+        margin: 0.25rem 0;
+    }
+    .ltr {
+        direction: ltr;
+        unicode-bidi: isolate;
+        display: inline-block;
+        white-space: nowrap;
+    }
     </style>
     """,
     unsafe_allow_html=True,
@@ -860,7 +977,22 @@ if results is not None:
     else:
         st.subheader("5 המועמדות הטובות ביותר כרגע")
         for idx, r in enumerate(results, start=1):
-            with st.expander(f"{idx}. {r.symbol} — {r.signal_type} — ציון {r.score:.0f}/100", expanded=(idx == 1)):
+            sector_etf = SECTOR_ETF.get(r.sector, "—")
+            sector_strength_text = fmt_pct(r.sector_rel_63) if r.sector_rel_63 is not None else "לא זמין"
+            with st.expander(f"{idx}. {r.symbol} — {r.signal_type} — {r.sector} — ציון {r.score:.0f}/100", expanded=(idx == 1)):
+                st.markdown(
+                    f"""
+                    <div class='company-box'>
+                        <div><b>חברה:</b> {r.company} <span class='ltr'>({r.symbol})</span></div>
+                        <div><b>על החברה בקצרה:</b> {r.company_summary or f'{r.company} היא חברה הנכללת במדד S&P 500.'}</div>
+                        <div><b>סקטור:</b> {SECTOR_HE.get(r.sector, r.sector)} <span class='ltr'>({r.sector})</span></div>
+                        <div><b>ETF סקטור להשוואה:</b> {ltr(sector_etf)}</div>
+                        <div><b>חוזק הסקטור מול SPY ב-63 ימים:</b> {ltr(sector_strength_text)}</div>
+                    </div>
+                    """,
+                    unsafe_allow_html=True,
+                )
+
                 c1, c2, c3, c4 = st.columns(4)
                 c1.metric("מחיר נוכחי", fmt_money(r.close))
                 c2.metric("כניסה / טריגר", fmt_money(r.entry))
@@ -871,45 +1003,59 @@ if results is not None:
                 c5.metric("יעד ראשון 2R", fmt_money(r.target_2r))
                 c6.metric("יעד שני 3R", fmt_money(r.target_3r))
                 c7.metric("חוזק יחסי", f"אחוזון {r.rs_percentile:.0f}")
-                c8.metric("נפח מול ממוצע", f"x{r.volume_ratio:.2f}")
+                c8.metric("סקטור", r.sector)
+
+                c9, c10 = st.columns(2)
+                c9.metric("חוזק סקטור מול SPY", sector_strength_text)
+                c10.metric("נפח מול ממוצע", f"x{r.volume_ratio:.2f}")
 
                 st.markdown("### מתי להיכנס")
-                st.write(
-                    f"כניסה טכנית רק מעל **{fmt_money(r.entry)}**. עדיף לא לרדוף אם הפתיחה/המחיר כבר גבוהים משמעותית מהטריגר."
+                st.markdown(
+                    f"<div class='rtl-line'>כניסה טכנית רק מעל {ltr(fmt_money(r.entry))}. עדיף לא לרדוף אם הפתיחה/המחיר כבר גבוהים משמעותית מהטריגר.</div>",
+                    unsafe_allow_html=True,
                 )
 
                 st.markdown("### איפה למקם סטופ")
-                st.write(
-                    f"סטופ טכני באזור **{fmt_money(r.stop)}**. אם המחיר מגיע לשם, הרעיון הטכני של העסקה כבר נפגע."
+                st.markdown(
+                    f"<div class='rtl-line'>סטופ טכני באזור {ltr(fmt_money(r.stop))}. אם המחיר מגיע לשם, הרעיון הטכני של העסקה כבר נפגע.</div>",
+                    unsafe_allow_html=True,
                 )
 
                 st.markdown("### מתי לצאת / יעד")
-                st.write(
-                    f"יעד ראשון: **{fmt_money(r.target_2r)}**. יעד שני: **{fmt_money(r.target_3r)}**. לאחר מהלך של כ-1R לטובתך, הגיוני לשקול הגנה על העסקה או קידום סטופ לפי שיקול דעת."
+                st.markdown(
+                    f"<div class='rtl-line'>יעד ראשון: {ltr(fmt_money(r.target_2r))}. יעד שני: {ltr(fmt_money(r.target_3r))}. לאחר מהלך של בערך {ltr('1R')} לטובתך, הגיוני לשקול הגנה על העסקה או קידום סטופ לפי שיקול דעת.</div>",
+                    unsafe_allow_html=True,
                 )
 
                 st.markdown("### למה היא נכנסה לסריקה")
                 for reason in r.reasons:
-                    st.write(f"• {reason}")
+                    bullet(reason)
 
                 st.markdown("### מתי לא להיכנס / מתי להיזהר")
                 for avoid in r.avoid_if:
-                    st.write(f"• {avoid}")
+                    bullet(avoid)
 
                 bt = r.backtest
                 st.markdown("### בדיקה היסטורית של איתותים דומים")
                 if bt.get("trades", 0) == 0:
                     st.write("לא נמצאו מספיק איתותים דומים בעבר הקרוב. לכן רמת הביטחון ההיסטורית נמוכה יותר.")
                 else:
-                    st.write(
-                        f"נמצאו **{bt['trades']}** איתותים דומים. אחוז הצלחה: **{fmt_pct(bt['win_rate'])}**. ממוצע תוצאה: **{fmt_r(bt['avg_r'])}**. העסקה הגרועה ביותר: **{fmt_r(bt['worst_r'])}**."
+                    st.markdown(
+                        f"<div class='rtl-line'>נמצאו {ltr(str(bt['trades']))} איתותים דומים. אחוז הצלחה: {ltr(fmt_pct(bt['win_rate']))}. ממוצע תוצאה: {ltr(fmt_r(bt['avg_r']))}. העסקה הגרועה ביותר: {ltr(fmt_r(bt['worst_r']))}.</div>",
+                        unsafe_allow_html=True,
                     )
                     if bt.get("last_trade"):
                         lt = bt["last_trade"]
-                        st.caption(f"איתות דומה אחרון: {lt['date']} | תוצאה: {lt['r']:.2f}R | יציאה: {lt['reason']}")
+                        lt_r = f"{lt['r']:.2f}R"
+                        st.markdown(
+                            f"<div class='small-note'>איתות דומה אחרון: {ltr(lt['date'])} | תוצאה: {ltr(lt_r)} | יציאה: {lt['reason']}</div>",
+                            unsafe_allow_html=True,
+                        )
 
-                st.caption(
-                    f"סקטור: {r.sector} | מרחק ממוצע 20: {fmt_pct(r.distance_sma20_pct)} | מרחק ממוצע 50: {fmt_pct(r.distance_sma50_pct)} | סגירת נר: {r.close_location:.2f}"
+                close_loc_txt = f"{r.close_location:.2f}"
+                st.markdown(
+                    f"<div class='small-note'>סקטור: {SECTOR_HE.get(r.sector, r.sector)} <span class='ltr'>({r.sector})</span> | מרחק ממוצע 20: {ltr(fmt_pct(r.distance_sma20_pct))} | מרחק ממוצע 50: {ltr(fmt_pct(r.distance_sma50_pct))} | סגירת נר: {ltr(close_loc_txt)}</div>",
+                    unsafe_allow_html=True,
                 )
 
 st.markdown("---")
