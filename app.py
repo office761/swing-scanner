@@ -84,6 +84,58 @@ SECTOR_HE = {
     "Unknown": "לא ידוע",
 }
 
+# Yahoo sometimes returns sector names that are close but not identical to the GICS names.
+# This keeps the sector ETF comparison working even when the source is not Wikipedia.
+YF_SECTOR_TO_GICS = {
+    "Technology": "Information Technology",
+    "Communication Services": "Communication Services",
+    "Consumer Cyclical": "Consumer Discretionary",
+    "Consumer Defensive": "Consumer Staples",
+    "Energy": "Energy",
+    "Financial Services": "Financials",
+    "Healthcare": "Health Care",
+    "Industrials": "Industrials",
+    "Basic Materials": "Materials",
+    "Real Estate": "Real Estate",
+    "Utilities": "Utilities",
+}
+
+# Lightweight local fallback for common S&P 500 candidates.
+# Used only when Wikipedia does not return sector/company metadata.
+STATIC_PROFILE = {
+    "TRGP": {"company": "Targa Resources", "sector": "Energy", "industry": "Oil & Gas Midstream"},
+    "BKR": {"company": "Baker Hughes", "sector": "Energy", "industry": "Oil & Gas Equipment & Services"},
+    "SLB": {"company": "Schlumberger", "sector": "Energy", "industry": "Oilfield Services"},
+    "HAL": {"company": "Halliburton", "sector": "Energy", "industry": "Oil & Gas Equipment & Services"},
+    "FANG": {"company": "Diamondback Energy", "sector": "Energy", "industry": "Oil & Gas E&P"},
+    "EOG": {"company": "EOG Resources", "sector": "Energy", "industry": "Oil & Gas E&P"},
+    "MPC": {"company": "Marathon Petroleum", "sector": "Energy", "industry": "Oil & Gas Refining & Marketing"},
+    "PSX": {"company": "Phillips 66", "sector": "Energy", "industry": "Oil & Gas Refining & Marketing"},
+    "VLO": {"company": "Valero Energy", "sector": "Energy", "industry": "Oil & Gas Refining & Marketing"},
+    "XOM": {"company": "Exxon Mobil", "sector": "Energy", "industry": "Oil & Gas Integrated"},
+    "CVX": {"company": "Chevron", "sector": "Energy", "industry": "Oil & Gas Integrated"},
+    "COP": {"company": "ConocoPhillips", "sector": "Energy", "industry": "Oil & Gas E&P"},
+    "OKE": {"company": "ONEOK", "sector": "Energy", "industry": "Oil & Gas Midstream"},
+    "WMB": {"company": "Williams Companies", "sector": "Energy", "industry": "Oil & Gas Midstream"},
+    "NVDA": {"company": "NVIDIA", "sector": "Information Technology", "industry": "Semiconductors"},
+    "AVGO": {"company": "Broadcom", "sector": "Information Technology", "industry": "Semiconductors"},
+    "AMD": {"company": "Advanced Micro Devices", "sector": "Information Technology", "industry": "Semiconductors"},
+    "MU": {"company": "Micron Technology", "sector": "Information Technology", "industry": "Semiconductors"},
+    "MRVL": {"company": "Marvell Technology", "sector": "Information Technology", "industry": "Semiconductors"},
+    "KLAC": {"company": "KLA", "sector": "Information Technology", "industry": "Semiconductor Equipment"},
+    "LRCX": {"company": "Lam Research", "sector": "Information Technology", "industry": "Semiconductor Equipment"},
+    "AMAT": {"company": "Applied Materials", "sector": "Information Technology", "industry": "Semiconductor Equipment"},
+    "AAPL": {"company": "Apple", "sector": "Information Technology", "industry": "Consumer Electronics"},
+    "MSFT": {"company": "Microsoft", "sector": "Information Technology", "industry": "Software"},
+    "AMZN": {"company": "Amazon", "sector": "Consumer Discretionary", "industry": "Internet Retail"},
+    "META": {"company": "Meta Platforms", "sector": "Communication Services", "industry": "Internet Content & Information"},
+    "GOOGL": {"company": "Alphabet", "sector": "Communication Services", "industry": "Internet Content & Information"},
+    "GOOG": {"company": "Alphabet", "sector": "Communication Services", "industry": "Internet Content & Information"},
+    "TSLA": {"company": "Tesla", "sector": "Consumer Discretionary", "industry": "Auto Manufacturers"},
+    "LLY": {"company": "Eli Lilly", "sector": "Health Care", "industry": "Drug Manufacturers"},
+    "JPM": {"company": "JPMorgan Chase", "sector": "Financials", "industry": "Banks"},
+}
+
 
 def normalize_symbol(sym: str) -> str:
     # Yahoo uses BRK-B instead of BRK.B
@@ -233,26 +285,36 @@ def get_next_earnings(symbol: str) -> Optional[str]:
 
 
 @st.cache_data(ttl=60 * 60 * 24, show_spinner=False)
-def get_company_profile(symbol: str, company: str, sector: str) -> Tuple[Optional[str], str]:
-    """Return a short, readable company profile for the UI.
+def get_company_profile(symbol: str, company: str, sector: str) -> Tuple[Optional[str], str, str, str]:
+    """Return company name, sector, industry and short readable profile.
 
-    This is intentionally lightweight: it enriches only top candidates, so the scan remains simple.
+    The previous version kept the sector as Unknown when Wikipedia metadata failed.
+    This version tries Yahoo profile data and then a local fallback for common S&P 500 names.
     """
-    sector_he = SECTOR_HE.get(sector, sector or "לא ידוע")
-    industry = None
+    symbol = normalize_symbol(symbol)
+    company_clean = company if company and company != symbol else STATIC_PROFILE.get(symbol, {}).get("company", company or symbol)
+    sector_clean = sector if sector and sector != "Unknown" else STATIC_PROFILE.get(symbol, {}).get("sector", "Unknown")
+    industry = STATIC_PROFILE.get(symbol, {}).get("industry")
+
     try:
         info = yf.Ticker(symbol).info or {}
-        industry = info.get("industry") or info.get("industryDisp") or info.get("category")
+        # Use Yahoo data only to enrich top candidates, not for the full scan.
+        company_clean = info.get("shortName") or info.get("longName") or company_clean
+        yf_sector = info.get("sector") or info.get("sectorDisp")
+        if yf_sector:
+            sector_clean = YF_SECTOR_TO_GICS.get(str(yf_sector), str(yf_sector))
+        industry = info.get("industry") or info.get("industryDisp") or industry
     except Exception:
-        industry = None
+        pass
 
-    if industry:
-        summary = f"{company} היא חברה בסקטור {sector_he} ({sector}), בתחום פעילות: {industry}."
-    elif sector and sector != "Unknown":
-        summary = f"{company} היא חברה בסקטור {sector_he} ({sector})."
+    sector_he = SECTOR_HE.get(sector_clean, sector_clean or "לא ידוע")
+    if industry and sector_clean != "Unknown":
+        summary = f"{company_clean} היא חברה בסקטור {sector_he}, בתחום פעילות: {industry}."
+    elif sector_clean != "Unknown":
+        summary = f"{company_clean} היא חברה בסקטור {sector_he}."
     else:
-        summary = f"{company} היא חברה הנכללת במדד S&P 500. לא התקבל מידע סקטוריאלי מלא ממקור הנתונים."
-    return industry, summary
+        summary = f"{company_clean} היא חברה הנכללת במדד S&P 500. לא התקבל מידע סקטוריאלי מלא ממקור הנתונים."
+    return company_clean, sector_clean, industry, summary
 
 
 # -----------------------------
@@ -728,11 +790,13 @@ def run_backtest(df_raw: pd.DataFrame, spy: pd.DataFrame, signal_type: str) -> d
                 break
 
         r_mult = (exit_price - entry) / risk
+        return_pct = (exit_price / entry - 1) * 100
         trades.append({
             "date": sig["date"].strftime("%Y-%m-%d") if hasattr(sig["date"], "strftime") else str(sig["date"]),
             "entry": entry,
             "exit": exit_price,
             "r": r_mult,
+            "return_pct": return_pct,
             "reason": exit_reason,
             "held": held,
         })
@@ -745,17 +809,23 @@ def run_backtest(df_raw: pd.DataFrame, spy: pd.DataFrame, signal_type: str) -> d
             "avg_r": None,
             "best_r": None,
             "worst_r": None,
+            "avg_success_r": None,
+            "avg_success_return_pct": None,
             "last_trade": None,
         }
 
     rs = [t["r"] for t in trades]
-    wins = [r for r in rs if r > 0]
+    wins = [t for t in trades if t["r"] > 0]
+    win_rs = [t["r"] for t in wins]
+    win_pcts = [t["return_pct"] for t in wins]
     return {
         "trades": len(trades),
         "win_rate": len(wins) / len(trades) * 100,
         "avg_r": float(np.mean(rs)),
         "best_r": float(np.max(rs)),
         "worst_r": float(np.min(rs)),
+        "avg_success_r": float(np.mean(win_rs)) if win_rs else None,
+        "avg_success_return_pct": float(np.mean(win_pcts)) if win_pcts else None,
         "last_trade": trades[-1],
     }
 
@@ -802,7 +872,14 @@ def scan() -> Tuple[List[SignalResult], str, bool]:
     candidates.sort(key=lambda x: x.score, reverse=True)
     checked: List[SignalResult] = []
     for c in candidates[:15]:
-        industry, summary = get_company_profile(c.symbol, c.company, c.sector)
+        company_name, sector_name, industry, summary = get_company_profile(c.symbol, c.company, c.sector)
+        c.company = company_name
+        if sector_name and sector_name != c.sector:
+            # Recalculate sector strength after enrichment so the UI no longer shows Unknown when data exists.
+            c.sector = sector_name
+            c.sector_rel_63 = sector_strength(c.sector, aux_data, aux_data["SPY"])
+            if c.sector_rel_63 is not None and c.sector_rel_63 > 0:
+                c.score += 4
         c.industry = industry
         c.company_summary = summary
         ed = get_next_earnings(c.symbol)
@@ -933,6 +1010,15 @@ st.markdown(
         display: inline-block;
         white-space: nowrap;
     }
+    /* Keep mobile cards readable in Hebrew while preserving numbers/tickers. */
+    [data-testid="stExpander"] {
+        direction: rtl !important;
+        text-align: right !important;
+    }
+    [data-testid="stExpander"] p, [data-testid="stExpander"] li {
+        direction: rtl !important;
+        text-align: right !important;
+    }
     </style>
     """,
     unsafe_allow_html=True,
@@ -1003,7 +1089,7 @@ if results is not None:
                 c5.metric("יעד ראשון 2R", fmt_money(r.target_2r))
                 c6.metric("יעד שני 3R", fmt_money(r.target_3r))
                 c7.metric("חוזק יחסי", f"אחוזון {r.rs_percentile:.0f}")
-                c8.metric("סקטור", r.sector)
+                c8.metric("סקטור", SECTOR_HE.get(r.sector, r.sector))
 
                 c9, c10 = st.columns(2)
                 c9.metric("חוזק סקטור מול SPY", sector_strength_text)
@@ -1040,15 +1126,18 @@ if results is not None:
                 if bt.get("trades", 0) == 0:
                     st.write("לא נמצאו מספיק איתותים דומים בעבר הקרוב. לכן רמת הביטחון ההיסטורית נמוכה יותר.")
                 else:
+                    success_return = fmt_pct(bt.get("avg_success_return_pct"))
+                    success_r = fmt_r(bt.get("avg_success_r"))
                     st.markdown(
-                        f"<div class='rtl-line'>נמצאו {ltr(str(bt['trades']))} איתותים דומים. אחוז הצלחה: {ltr(fmt_pct(bt['win_rate']))}. ממוצע תוצאה: {ltr(fmt_r(bt['avg_r']))}. העסקה הגרועה ביותר: {ltr(fmt_r(bt['worst_r']))}.</div>",
+                        f"<div class='rtl-line'>נמצאו {ltr(str(bt['trades']))} איתותים דומים. אחוז הצלחה: {ltr(fmt_pct(bt['win_rate']))}. ממוצע תוצאה כולל: {ltr(fmt_r(bt['avg_r']))}. ממוצע תשואה בעסקאות שהצליחו: {ltr(success_return)} ({ltr(success_r)}). העסקה הגרועה ביותר: {ltr(fmt_r(bt['worst_r']))}.</div>",
                         unsafe_allow_html=True,
                     )
                     if bt.get("last_trade"):
                         lt = bt["last_trade"]
                         lt_r = f"{lt['r']:.2f}R"
+                        lt_pct = fmt_pct(lt.get("return_pct"))
                         st.markdown(
-                            f"<div class='small-note'>איתות דומה אחרון: {ltr(lt['date'])} | תוצאה: {ltr(lt_r)} | יציאה: {lt['reason']}</div>",
+                            f"<div class='small-note'>איתות דומה אחרון: {ltr(lt['date'])} | תוצאה: {ltr(lt_r)} / {ltr(lt_pct)} | יציאה: {lt['reason']}</div>",
                             unsafe_allow_html=True,
                         )
 
@@ -1061,7 +1150,7 @@ if results is not None:
 st.markdown("---")
 st.markdown(
     "<div class='small-note'>"
-    "המנגנון מאחורי הקלעים: מצב שוק SPY/QQQ, חוזק יחסי מול SPY, חוזק סקטור, מגמה 50/200, פריצה מאושרת או ריטסט, נפח, מניעת רדיפה אחרי מניות מתוחות מדי, יחס סיכון-סיכוי ו-Backtest קצר."
+    "המנגנון מאחורי הקלעים: מצב שוק SPY/QQQ, חוזק יחסי מול SPY, חוזק סקטור, מגמה 50/200, פריצה מאושרת או ריטסט, נפח, מניעת רדיפה אחרי מניות מתוחות מדי, יחס סיכון-סיכוי ו-Backtest קצר כולל ממוצע תשואה בעסקאות שהצליחו."
     "</div>",
     unsafe_allow_html=True,
 )
