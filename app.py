@@ -1000,65 +1000,92 @@ def company_blurb(row):
 
 
 def render_result(row, idx):
+    """Render one result using native Streamlit elements only.
+
+    Previous versions used a large raw-HTML block. On mobile, Streamlit sometimes
+    escaped that block and displayed the HTML tags as text. This renderer avoids
+    raw HTML entirely inside the result card, so Hebrew/English/numbers stay
+    readable and no tags are shown to the user.
+    """
     symbol = row["symbol"]
     m = row["metrics"]
     p = row["pattern"]
     s = row["stretch"]
     plan = row["plan"]
-    bt = row.get("backtest", {})
-    news = row.get("news", {})
-    title = f"{idx}. {symbol} — {p['type']} — {row['sector_he']} — ציון {int(round(row['score']))}/100"
+    bt = row.get("backtest", {}) or {}
+    news = row.get("news", {}) or {}
+
+    sector_label = row.get("sector_he") or row.get("sector") or "לא ידוע"
+    title = f"{idx}. {symbol} — {p.get('type', 'איתות')} — {sector_label} — ציון {int(round(row['score']))}/100"
 
     with st.expander(title, expanded=(idx == 1)):
-        st.markdown(
-            f"""
-            <div class="stock-card">
-                <div class="section-title">הסבר קצר על החברה</div>
-                <div class="small-note">{company_blurb(row)}</div>
+        st.subheader(f"{symbol} — {row.get('company', symbol)}")
+        st.caption(f"סוג איתות: {p.get('type', 'לא ידוע')} | ציון: {int(round(row['score']))}/100")
 
-                <div class="section-title">נתוני חברה וסקטור</div>
-                <span class="pill">חברה: <b>{row['company']}</b></span>
-                <span class="pill">סקטור: <b>{row['sector_he']}</b> / <span class="ltr">{row['sector']}</span></span>
-                <span class="pill">תחום: <b>{row['industry']}</b></span>
-                <span class="pill">ETF סקטוריאלי: <b class="ltr">{row['sector_etf']}</b></span>
-                <span class="pill">חוזק סקטור: <b>{row['sector_msg']}</b></span>
+        st.markdown("### הסבר קצר על החברה")
+        st.write(company_blurb(row))
 
-                <div class="section-title">מתי להיכנס</div>
-                <div>{plan['text']}</div>
-                <div class="small-note">סוג המלצה: <b>{plan['mode']}</b></div>
+        st.markdown("### נתוני חברה וסקטור")
+        info_rows = [
+            ("חברה", f"{row.get('company', symbol)} ({symbol})"),
+            ("סקטור", f"{row.get('sector_he', 'לא ידוע')} / {row.get('sector', 'Unknown')}"),
+            ("תחום פעילות", row.get("industry") or "לא ידוע"),
+            ("ETF סקטוריאלי", row.get("sector_etf") or "—"),
+            ("חוזק הסקטור מול SPY", row.get("sector_msg") or "לא זמין"),
+        ]
+        for label, value in info_rows:
+            st.write(f"**{label}:** {value}")
 
-                <div class="section-title">סטופ ויעדים</div>
-                <div>סטופ לוס: <b>{money(plan['stop'])}</b></div>
-                <div>יעד ראשון: <b>{money(plan['target1'])}</b></div>
-                <div>יעד שני: <b>{money(plan['target2'])}</b></div>
-                <div>סיכון עד הסטופ: <b>{pct_text(plan['risk_pct'])}</b></div>
+        st.markdown("### נתוני מחיר מרכזיים")
+        c1, c2, c3 = st.columns(3)
+        c1.metric("מחיר נוכחי", money(m.get("close")))
+        c2.metric("כניסה / טריגר", money(plan.get("entry")))
+        c3.metric("סוג המלצה", plan.get("mode", "—"))
 
-                <div class="section-title">מדוע היא נכנסה לסריקה</div>
-                <div>{p.get('description','')}</div>
-                <div>חוזק יחסי מול SPY: 63 ימים {pct_text(row['rel63'])}, 126 ימים {pct_text(row['rel126'])}.</div>
-                <div>דירוג חוזק יחסי בתוך הסריקה: <b>{num_text(row['rs_rank'], 0)}</b> מתוך 100.</div>
+        st.markdown("### מתי להיכנס")
+        if s.get("level") == "high":
+            st.warning(plan.get("text", "אין הנחיית כניסה זמינה."))
+        elif s.get("level") == "medium":
+            st.info(plan.get("text", "אין הנחיית כניסה זמינה."))
+        else:
+            st.success(plan.get("text", "אין הנחיית כניסה זמינה."))
 
-                <div class="section-title">סטטוס מתיחה מהממוצעים</div>
-                <div><b>{s['label']}</b> — מרחק ממוצע 20: {pct_text(s['dist20'])}, מרחק ממוצע 50: {pct_text(s['dist50'])}.</div>
-                <div class="small-note">{s['text']}</div>
-            </div>
-            """,
-            unsafe_allow_html=True,
+        st.markdown("### סטופ ויעדים")
+        s1, s2, s3, s4 = st.columns(4)
+        s1.metric("סטופ לוס", money(plan.get("stop")))
+        s2.metric("יעד ראשון", money(plan.get("target1")))
+        s3.metric("יעד שני", money(plan.get("target2")))
+        s4.metric("סיכון עד הסטופ", pct_text(plan.get("risk_pct")))
+
+        st.markdown("### מדוע היא נכנסה לסריקה")
+        st.write(p.get("description", "לא קיים הסבר זמין."))
+        st.write(f"**חוזק יחסי מול SPY:** 63 ימים {pct_text(row.get('rel63'))}, 126 ימים {pct_text(row.get('rel126'))}.")
+        st.write(f"**דירוג חוזק יחסי בתוך הסריקה:** {num_text(row.get('rs_rank'), 0)} מתוך 100.")
+
+        st.markdown("### סטטוס מתיחה מהממוצעים")
+        stretch_msg = (
+            f"{s.get('label', 'לא ידוע')} — מרחק ממוצע 20: {pct_text(s.get('dist20'))}, "
+            f"מרחק ממוצע 50: {pct_text(s.get('dist50'))}. {s.get('text', '')}"
         )
+        if s.get("level") == "high":
+            st.warning(stretch_msg)
+        elif s.get("level") == "medium":
+            st.info(stretch_msg)
+        else:
+            st.success(stretch_msg)
 
-        st.markdown("#### חדשות ודוחות")
-        news_summary = news.get("news_summary", "לא זמין")
+        st.markdown("### חדשות ודוחות")
         earnings_warning = news.get("earnings_warning")
         if earnings_warning:
             st.warning(earnings_warning)
-        st.write(news_summary)
+        st.write(news.get("news_summary", "לא נמצאו חדשות מהותיות זמינות במקור הנתונים."))
         items = news.get("news_items") or []
         if items:
             for item in items:
-                sign = "חיובי" if item["score"] > 0 else ("שלילי" if item["score"] < 0 else "נייטרלי")
-                st.markdown(f"- **{sign}:** {item['title']}")
+                sign = "חיובי" if item.get("score", 0) > 0 else ("שלילי" if item.get("score", 0) < 0 else "נייטרלי")
+                st.markdown(f"- **{sign}:** {item.get('title', '')}")
 
-        st.markdown("#### בדיקה היסטורית של איתותים דומים")
+        st.markdown("### בדיקה היסטורית של איתותים דומים")
         if bt.get("trades", 0) == 0:
             st.info("לא נמצאו מספיק איתותים דומים בעבר לצורך מדידה היסטורית משמעותית.")
         else:
@@ -1080,14 +1107,13 @@ def render_result(row, idx):
                 "הבדיקה ההיסטורית אינה הבטחה לתוצאה עתידית. היא בודקת מה קרה בעבר כאשר הופיעו תנאים דומים של מגמה, פריצה/ריטסט, חוזק יחסי וסיכון."
             )
 
-        st.markdown("#### מתי לא להיכנס")
-        if s["level"] == "high":
+        st.markdown("### מתי לא להיכנס")
+        if s.get("level") == "high":
             st.write("לא להיכנס במרדף אחרי המחיר הנוכחי. להמתין לריטסט, דשדוש קצר, או פריצת המשך חדשה לאחר מנוחה.")
-        elif s["level"] == "medium":
+        elif s.get("level") == "medium":
             st.write("לא להיכנס אם המחיר פותח בגאפ חד למעלה בלי יכולת להציב סטופ סביר. עדיף להמתין לאישור או ריטסט.")
         else:
             st.write("לא להיכנס אם המחיר חוזר מתחת לרמת הפריצה/התבנית, אם השוק הכללי נשבר, או אם הסיכון עד הסטופ גדול מדי.")
-
 
 def main():
     st.title("📈 סורק סווינג — S&P 500")
