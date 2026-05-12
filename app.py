@@ -1,10 +1,6 @@
 
 import re
 import math
-import json
-import threading
-import traceback
-from pathlib import Path
 from datetime import datetime, timedelta, date
 from concurrent.futures import ThreadPoolExecutor, as_completed
 
@@ -1203,216 +1199,6 @@ def render_result(row, idx):
         else:
             st.write("לא להיכנס אם המחיר חוזר מתחת לרמת הפריצה/התבנית, אם השוק הכללי נשבר, או אם הסיכון עד הסטופ גדול מדי.")
 
-
-# -----------------------------
-# Background scan support
-# -----------------------------
-STATE_FILE = Path("latest_scan_results.json")
-SCAN_LOCK = threading.Lock()
-SCAN_STATE = {
-    "running": False,
-    "progress": 0,
-    "status": "מוכן לסריקה",
-    "started_at": None,
-    "finished_at": None,
-    "results": None,
-    "market": None,
-    "error": None,
-}
-
-
-def json_safe(value):
-    """Convert numpy/pandas values to regular Python values for storage."""
-    if isinstance(value, dict):
-        out = {}
-        for k, v in value.items():
-            if k == "df":
-                continue
-            out[str(k)] = json_safe(v)
-        return out
-    if isinstance(value, list):
-        return [json_safe(v) for v in value]
-    if isinstance(value, tuple):
-        return [json_safe(v) for v in value]
-    if isinstance(value, (np.integer,)):
-        return int(value)
-    if isinstance(value, (np.floating,)):
-        v = float(value)
-        return None if math.isnan(v) or math.isinf(v) else v
-    if isinstance(value, float):
-        return None if math.isnan(value) or math.isinf(value) else value
-    if isinstance(value, (pd.Timestamp, datetime, date)):
-        return value.isoformat()
-    return value
-
-
-def set_scan_state(**kwargs):
-    with SCAN_LOCK:
-        SCAN_STATE.update(kwargs)
-
-
-def get_scan_state():
-    with SCAN_LOCK:
-        return dict(SCAN_STATE)
-
-
-def save_latest_results(results, market):
-    payload = {
-        "finished_at": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
-        "results": json_safe(results),
-        "market": json_safe(market),
-    }
-    try:
-        STATE_FILE.write_text(json.dumps(payload, ensure_ascii=False, indent=2), encoding="utf-8")
-    except Exception:
-        pass
-    return payload
-
-
-def load_latest_results():
-    try:
-        if STATE_FILE.exists():
-            return json.loads(STATE_FILE.read_text(encoding="utf-8"))
-    except Exception:
-        return None
-    return None
-
-
-def run_scan_core():
-    """Run the full scan without using Streamlit UI calls.
-
-    This lets the server keep scanning even if the phone browser is sent to the
-    background. The user can return later and see the saved results.
-    """
-    set_scan_state(progress=5, status="מוריד רשימת מניות S&P 500...")
-    universe = get_universe()
-    sector_etfs = sorted(set(SECTOR_ETF.values()))
-    all_symbols = list(universe["symbol"].unique()) + ["SPY", "QQQ", "^VIX"] + sector_etfs
-
-    set_scan_state(progress=15, status="מוריד נתוני מחיר, מדדים ו-VIX...")
-    data = download_data(all_symbols)
-
-    set_scan_state(progress=35, status="בודק מצב שוק: SPY / QQQ / VIX...")
-    market = market_regime(data)
-
-    set_scan_state(progress=42, status="מחשב דירוג חוזק יחסי לכל מניה...")
-    rows_for_rank = []
-    for _, r in universe.iterrows():
-        sym = r["symbol"]
-        if sym in data:
-            lm = latest_metrics(data[sym])
-            if lm:
-                m, _ = lm
-                score = 0
-                for key, w in [("ret21", 0.2), ("ret63", 0.35), ("ret126", 0.3), ("ret252", 0.15)]:
-                    score += (m.get(key) or 0) * w
-                rows_for_rank.append((sym, score))
-    if rows_for_rank:
-        rank_df = pd.DataFrame(rows_for_rank, columns=["symbol", "rs_score"])
-        rank_df["percentile"] = rank_df["rs_score"].rank(pct=True) * 100
-        percentile_lookup = dict(zip(rank_df["symbol"], rank_df["percentile"]))
-    else:
-        percentile_lookup = {}
-
-    set_scan_state(progress=52, status="מסנן מניות לפי מגמה, חוזק, סקטור, פריצה/ריטסט וסיכון...")
-    candidates = []
-    for _, r in universe.iterrows():
-        sym = r["symbol"]
-        if sym not in data:
-            continue
-        analyzed = analyze_stock(
-            sym,
-            r.get("company", sym),
-            r.get("sector", "Unknown"),
-            r.get("industry", "לא זמין"),
-            data[sym],
-            data,
-            market,
-            percentile_lookup,
-        )
-        if analyzed:
-            candidates.append(analyzed)
-
-    if not candidates:
-        return [], market
-
-    candidates = sorted(candidates, key=lambda x: x["score_base"], reverse=True)[:25]
-    set_scan_state(progress=68, status="מבצע Backtest, חדשות ודוחות למועמדות המובילות...")
-
-    enriched = []
-    spy_df = data.get("SPY")
-    max_workers = min(6, max(1, len(candidates)))
-    completed = 0
-    with ThreadPoolExecutor(max_workers=max_workers) as executor:
-        futures = [executor.submit(enrich_candidate_fast, c, spy_df) for c in candidates]
-        for fut in as_completed(futures):
-            try:
-                enriched.append(fut.result())
-            except Exception:
-                pass
-            completed += 1
-            set_scan_state(
-                progress=68 + int(completed / max(1, len(candidates)) * 27),
-                status=f"בודק מועמדות מובילות... {completed}/{len(candidates)}",
-            )
-
-    results = sorted(enriched, key=lambda x: x["score"], reverse=True)[:5]
-    # Strip raw DataFrames before storing/rendering from a future session.
-    clean_results = json_safe(results)
-    return clean_results, json_safe(market)
-
-
-def background_worker():
-    try:
-        set_scan_state(
-            running=True,
-            progress=0,
-            status="הסריקה התחילה. אפשר לעבור לאפליקציה אחרת ולחזור בעוד כמה דקות.",
-            started_at=datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
-            finished_at=None,
-            error=None,
-            results=None,
-            market=None,
-        )
-        results, market = run_scan_core()
-        payload = save_latest_results(results, market)
-        set_scan_state(
-            running=False,
-            progress=100,
-            status="הסריקה הסתיימה. התוצאות נשמרו.",
-            finished_at=payload.get("finished_at"),
-            results=results,
-            market=market,
-            error=None,
-        )
-    except Exception as exc:
-        set_scan_state(
-            running=False,
-            progress=0,
-            status="הסריקה נכשלה.",
-            error=f"{exc}\n{traceback.format_exc()}",
-            finished_at=datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
-        )
-
-
-def start_background_scan():
-    state = get_scan_state()
-    if state.get("running"):
-        return False
-    thread = threading.Thread(target=background_worker, daemon=True)
-    thread.start()
-    return True
-
-
-def get_current_or_saved_results():
-    state = get_scan_state()
-    if state.get("results") is not None:
-        return state.get("results"), state.get("market"), state.get("finished_at")
-    saved = load_latest_results()
-    if saved:
-        return saved.get("results"), saved.get("market"), saved.get("finished_at")
-    return None, None, None
-
 def main():
     st.title("📈 סורק סווינג — S&P 500")
     st.markdown(
@@ -1425,47 +1211,122 @@ def main():
         unsafe_allow_html=True,
     )
 
-    state = get_scan_state()
+    if "results" not in st.session_state:
+        st.session_state.results = None
+        st.session_state.market = None
 
-    if st.button("סרוק עכשיו", type="primary", use_container_width=True, disabled=state.get("running", False)):
-        started = start_background_scan()
-        if started:
-            st.success("הסריקה התחילה בשרת. אפשר לעבור לפייסבוק/וואטסאפ ולחזור לקישור בעוד כמה דקות. התוצאה האחרונה תישמר כאן.")
+    if st.button("סרוק עכשיו", type="primary", use_container_width=True):
+        st.session_state.results = None
+        st.session_state.market = None
+
+        universe = get_universe()
+        sector_etfs = sorted(set(SECTOR_ETF.values()))
+        all_symbols = list(universe["symbol"].unique()) + ["SPY", "QQQ", "^VIX"] + sector_etfs
+
+        progress = st.progress(0)
+        status = st.empty()
+
+        status.write("מוריד נתוני שוק ומניות S&P 500...")
+        data = download_data(all_symbols)
+        progress.progress(25)
+
+        status.write("בודק מצב שוק, SPY / QQQ / VIX...")
+        market = market_regime(data)
+        progress.progress(35)
+
+        # Compute relative strength ranks from available stocks
+        rows_for_rank = []
+        for _, r in universe.iterrows():
+            sym = r["symbol"]
+            if sym in data:
+                lm = latest_metrics(data[sym])
+                if lm:
+                    m, _ = lm
+                    score = 0
+                    for key, w in [("ret21", 0.2), ("ret63", 0.35), ("ret126", 0.3), ("ret252", 0.15)]:
+                        score += (m.get(key) or 0) * w
+                    rows_for_rank.append((sym, score))
+        if rows_for_rank:
+            rank_df = pd.DataFrame(rows_for_rank, columns=["symbol", "rs_score"])
+            rank_df["percentile"] = rank_df["rs_score"].rank(pct=True) * 100
+            percentile_lookup = dict(zip(rank_df["symbol"], rank_df["percentile"]))
         else:
-            st.info("כבר רצה סריקה. חזור בעוד כמה דקות או רענן את הדף.")
-        state = get_scan_state()
+            percentile_lookup = {}
 
-    state = get_scan_state()
-    if state.get("running"):
-        st.info(state.get("status", "הסריקה רצה..."))
-        st.progress(int(state.get("progress") or 0))
-        st.caption("אפשר לצאת מהחלון. כשתחזור לקישור, יוצגו התוצאות האחרונות שנשמרו. אם אתה נשאר במסך הזה, רענן מדי פעם כדי לראות התקדמות.")
-    elif state.get("error"):
-        st.error("הסריקה האחרונה נכשלה. אפשר לנסות שוב או לשלוח צילום מסך של השגיאה.")
-        with st.expander("פירוט טכני"):
-            st.code(state.get("error", ""))
+        progress.progress(45)
+        status.write("מסנן מניות לפי מגמה, חוזק יחסי, תבנית, סקטור וסיכון...")
+        candidates = []
+        for _, r in universe.iterrows():
+            sym = r["symbol"]
+            if sym not in data:
+                continue
+            analyzed = analyze_stock(
+                sym,
+                r.get("company", sym),
+                r.get("sector", "Unknown"),
+                r.get("industry", "לא זמין"),
+                data[sym],
+                data,
+                market,
+                percentile_lookup,
+            )
+            if analyzed:
+                candidates.append(analyzed)
 
-    results, market, finished_at = get_current_or_saved_results()
+        if not candidates:
+            progress.progress(100)
+            st.session_state.results = []
+            st.session_state.market = market
+            status.empty()
+            st.warning("לא נמצאו מניות שעברו את הסינון כרגע. ייתכן שהשוק חלש או שמקור הנתונים לא החזיר מספיק מידע.")
+            return
 
-    if market:
-        if market.get("risk_flag") == "good":
-            st.success(f"{market.get('status')} — {market.get('message')}")
-        elif market.get("risk_flag") == "bad":
-            st.error(f"{market.get('status')} — {market.get('message')}")
+        # Preselect only the strongest candidates for the expensive layer.
+        # The full universe is still scanned first; this only avoids running slow
+        # news/earnings/backtest calls on weak candidates that cannot realistically
+        # reach the final top 5.
+        candidates = sorted(candidates, key=lambda x: x["score_base"], reverse=True)[:25]
+        progress.progress(62)
+
+        status.write("מבצע Backtest, חדשות ודוחות במקביל למועמדות המובילות...")
+        enriched = []
+        spy_df = data.get("SPY")
+        max_workers = min(6, max(1, len(candidates)))
+        completed = 0
+        with ThreadPoolExecutor(max_workers=max_workers) as executor:
+            futures = [executor.submit(enrich_candidate_fast, c, spy_df) for c in candidates]
+            for fut in as_completed(futures):
+                try:
+                    enriched.append(fut.result())
+                except Exception:
+                    pass
+                completed += 1
+                progress.progress(62 + int(completed / len(candidates) * 30))
+
+        # Backtest as filter-lite: do not eliminate aggressively, but poor history lowers ranking.
+        results = sorted(enriched, key=lambda x: x["score"], reverse=True)[:5]
+        progress.progress(100)
+        status.empty()
+        st.session_state.results = results
+        st.session_state.market = market
+
+    if st.session_state.market:
+        m = st.session_state.market
+        if m["risk_flag"] == "good":
+            st.success(f"{m['status']} — {m['message']}")
+        elif m["risk_flag"] == "bad":
+            st.error(f"{m['status']} — {m['message']}")
         else:
-            st.warning(f"{market.get('status')} — {market.get('message')}")
+            st.warning(f"{m['status']} — {m['message']}")
 
-    if finished_at:
-        st.caption(f"עודכן לאחרונה: {bidi_isolate(finished_at)}")
-
-    if results is None:
-        st.info("עדיין אין תוצאות שמורות. לחץ על ‘סרוק עכשיו’, אפשר לצאת מהחלון, וחזור בעוד כמה דקות.")
-    elif not results:
-        st.info("אין כרגע 5 מניות איכותיות להצגה לפי תנאי הסריקה.")
-    else:
-        st.subheader("5 המניות המובילות כרגע")
-        for i, row in enumerate(results, start=1):
-            render_result(row, i)
+    results = st.session_state.results
+    if results is not None:
+        if not results:
+            st.info("אין כרגע 5 מניות איכותיות להצגה לפי תנאי הסריקה.")
+        else:
+            st.subheader("5 המניות המובילות כרגע")
+            for i, row in enumerate(results, start=1):
+                render_result(row, i)
 
     st.markdown(
         """
