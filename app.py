@@ -180,22 +180,27 @@ def yahoo_symbol(symbol: str) -> str:
     return str(symbol).strip().upper().replace(".", "-")
 
 
+def bidi_isolate(text):
+    """Keep English tickers/numbers readable inside Hebrew RTL text."""
+    return f"\u2066{text}\u2069"
+
+
 def money(x):
     if x is None or (isinstance(x, float) and (np.isnan(x) or np.isinf(x))):
         return "—"
-    return f'<span class="ltr">${x:,.2f}</span>'
+    return bidi_isolate(f"${x:,.2f}")
 
 
 def pct_text(x, digits=1):
     if x is None or (isinstance(x, float) and (np.isnan(x) or np.isinf(x))):
         return "—"
-    return f'<span class="ltr">{x:.{digits}f}%</span>'
+    return bidi_isolate(f"{x:.{digits}f}%")
 
 
 def num_text(x, digits=2):
     if x is None or (isinstance(x, float) and (np.isnan(x) or np.isinf(x))):
         return "—"
-    return f'<span class="ltr">{x:.{digits}f}</span>'
+    return bidi_isolate(f"{x:.{digits}f}")
 
 
 def safe_float(x):
@@ -252,15 +257,29 @@ def get_universe():
     return df.drop_duplicates("symbol")
 
 
-def clean_ohlcv(df):
+def clean_ohlcv(df, require_volume=True):
     if df is None or df.empty:
         return None
-    cols = [c for c in ["Open", "High", "Low", "Close", "Volume"] if c in df.columns]
-    if len(cols) < 5:
+
+    # Some indexes, especially ^VIX, often have zero/empty volume.
+    # For price-based market-regime logic we only need OHLC, so volume is optional there.
+    needed = ["Open", "High", "Low", "Close"]
+    if not all(c in df.columns for c in needed):
         return None
-    out = df[cols].copy()
-    out = out.dropna(subset=["Open", "High", "Low", "Close", "Volume"])
-    out = out[out["Volume"] > 0]
+
+    out = df.copy()
+    if "Volume" not in out.columns:
+        out["Volume"] = 1
+
+    out = out[["Open", "High", "Low", "Close", "Volume"]].copy()
+    out = out.dropna(subset=["Open", "High", "Low", "Close"])
+    out["Volume"] = pd.to_numeric(out["Volume"], errors="coerce").fillna(0)
+
+    if require_volume:
+        out = out[out["Volume"] > 0]
+    else:
+        out.loc[out["Volume"] <= 0, "Volume"] = 1
+
     if len(out) < 260:
         return None
     return out
@@ -271,6 +290,9 @@ def download_data(symbols):
     data = {}
     symbols = list(dict.fromkeys([yahoo_symbol(s) for s in symbols if s]))
     chunk_size = 90
+
+    def is_price_index(sym):
+        return str(sym).startswith("^")
 
     for start in range(0, len(symbols), chunk_size):
         chunk = symbols[start:start+chunk_size]
@@ -291,20 +313,62 @@ def download_data(symbols):
             continue
 
         if isinstance(raw.columns, pd.MultiIndex):
+            level0 = list(raw.columns.get_level_values(0))
             for sym in chunk:
                 try:
-                    if sym in raw.columns.get_level_values(0):
+                    if sym in level0:
                         df = raw[sym].copy()
-                        cleaned = clean_ohlcv(df)
+                        cleaned = clean_ohlcv(df, require_volume=not is_price_index(sym))
                         if cleaned is not None:
                             data[sym] = cleaned
                 except Exception:
                     pass
         else:
             if len(chunk) == 1:
-                cleaned = clean_ohlcv(raw.copy())
+                cleaned = clean_ohlcv(raw.copy(), require_volume=not is_price_index(chunk[0]))
                 if cleaned is not None:
                     data[chunk[0]] = cleaned
+
+    # Robust dedicated fallback for indexes. In particular, ^VIX often fails in
+    # multi-ticker downloads or has zero volume, which used to make it appear
+    # as "not available" even when prices were actually present.
+    for sym in ["SPY", "QQQ", "^VIX"]:
+        if sym in symbols and sym not in data:
+            try:
+                raw = yf.download(
+                    tickers=sym,
+                    period="3y",
+                    interval="1d",
+                    auto_adjust=True,
+                    threads=False,
+                    progress=False,
+                )
+                cleaned = clean_ohlcv(raw, require_volume=not is_price_index(sym))
+                if cleaned is not None:
+                    data[sym] = cleaned
+            except Exception:
+                pass
+
+    # Last-resort Stooq fallback for VIX only. Stooq index data may have no
+    # meaningful volume, so volume is filled with 1.
+    if "^VIX" in symbols and "^VIX" not in data:
+        try:
+            url = "https://stooq.com/q/d/l/?s=%5Evix&i=d"
+            raw = pd.read_csv(url)
+            raw["Date"] = pd.to_datetime(raw["Date"], errors="coerce")
+            raw = raw.dropna(subset=["Date"]).set_index("Date")
+            raw = raw.rename(columns={
+                "Open": "Open", "High": "High", "Low": "Low",
+                "Close": "Close", "Volume": "Volume"
+            })
+            if "Volume" not in raw.columns:
+                raw["Volume"] = 1
+            cleaned = clean_ohlcv(raw, require_volume=False)
+            if cleaned is not None:
+                data["^VIX"] = cleaned
+        except Exception:
+            pass
+
     return data
 
 
@@ -388,21 +452,22 @@ def market_regime(data):
     elif qqq_m["close"] > qqq_m["sma50"]:
         score += 20
 
-    vix_msg = "VIX לא זמין"
+    vix_msg = "VIX לא זמין — הסורק ממשיך לעבוד, אבל ללא שכבת תנודתיות שוק."
     vix_flag = False
     if vix is not None and len(vix) > 10:
-        vclose = float(vix["Close"].iloc[-1])
-        vprev5 = float(vix["Close"].iloc[-6]) if len(vix) >= 6 else vclose
-        vchg = (vclose / vprev5 - 1) * 100 if vprev5 else 0
-        if vclose < 20 and vchg < 15:
-            score += 20
-            vix_msg = f"VIX רגוע יחסית: {vclose:.1f}"
-        elif vclose < 25 and vchg < 25:
-            score += 10
-            vix_msg = f"VIX בינוני: {vclose:.1f}"
-        else:
-            vix_flag = True
-            vix_msg = f"VIX גבוה/קופץ: {vclose:.1f}, שינוי 5 ימים {vchg:.1f}%"
+        vclose = safe_float(vix["Close"].iloc[-1])
+        vprev5 = safe_float(vix["Close"].iloc[-6]) if len(vix) >= 6 else vclose
+        vchg = (vclose / vprev5 - 1) * 100 if vclose and vprev5 else 0
+        if vclose is not None:
+            if vclose < 20 and vchg < 15:
+                score += 20
+                vix_msg = f"VIX זמין ורגוע יחסית: {vclose:.1f}"
+            elif vclose < 25 and vchg < 25:
+                score += 10
+                vix_msg = f"VIX זמין ובינוני: {vclose:.1f}"
+            else:
+                vix_flag = True
+                vix_msg = f"VIX זמין אך גבוה/קופץ: {vclose:.1f}, שינוי 5 ימים {vchg:.1f}%"
 
     if score >= 75:
         status = "שוק תומך בלונגים"
