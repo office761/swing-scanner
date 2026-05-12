@@ -2,6 +2,7 @@
 import re
 import math
 from datetime import datetime, timedelta, date
+from concurrent.futures import ThreadPoolExecutor, as_completed
 
 import numpy as np
 import pandas as pd
@@ -289,7 +290,8 @@ def clean_ohlcv(df, require_volume=True):
 def download_data(symbols):
     data = {}
     symbols = list(dict.fromkeys([yahoo_symbol(s) for s in symbols if s]))
-    chunk_size = 90
+    # Larger chunks reduce the number of network round-trips without changing the scan logic.
+    chunk_size = 125
 
     def is_price_index(sym):
         return str(sym).startswith("^")
@@ -1053,6 +1055,23 @@ def analyze_stock(symbol, company, sector, industry, df, data, market, percentil
         return None
 
 
+
+def enrich_candidate_fast(candidate, spy_df):
+    """Add backtest/news to one candidate.
+
+    This is intentionally isolated so the app can enrich the top candidates in
+    parallel. The scoring logic is unchanged; only the execution is faster.
+    """
+    c = candidate.copy()
+    bt = backtest(c["df"], spy_df)
+    news = get_news_and_earnings(c["symbol"])
+    c["backtest"] = bt
+    c["news"] = news
+    c["score"] = c["score_base"] + score_backtest(bt) + news.get("news_score", 0)
+    if news.get("earnings_warning"):
+        c["score"] -= 2  # warning only, not exclusion
+    return c
+
 def company_blurb(row):
     company = row["company"]
     sector_he = row["sector_he"]
@@ -1262,23 +1281,27 @@ def main():
             st.warning("לא נמצאו מניות שעברו את הסינון כרגע. ייתכן שהשוק חלש או שמקור הנתונים לא החזיר מספיק מידע.")
             return
 
-        # Preselect top 30 for expensive enrichment
-        candidates = sorted(candidates, key=lambda x: x["score_base"], reverse=True)[:30]
+        # Preselect only the strongest candidates for the expensive layer.
+        # The full universe is still scanned first; this only avoids running slow
+        # news/earnings/backtest calls on weak candidates that cannot realistically
+        # reach the final top 5.
+        candidates = sorted(candidates, key=lambda x: x["score_base"], reverse=True)[:25]
         progress.progress(62)
 
-        status.write("מבצע Backtest ומוסיף חדשות/דוחות למועמדות המובילות...")
+        status.write("מבצע Backtest, חדשות ודוחות במקביל למועמדות המובילות...")
         enriched = []
         spy_df = data.get("SPY")
-        for i, c in enumerate(candidates):
-            bt = backtest(c["df"], spy_df)
-            news = get_news_and_earnings(c["symbol"])
-            c["backtest"] = bt
-            c["news"] = news
-            c["score"] = c["score_base"] + score_backtest(bt) + news.get("news_score", 0)
-            if news.get("earnings_warning"):
-                c["score"] -= 2  # warning only, not exclusion
-            enriched.append(c)
-            progress.progress(62 + int((i+1) / len(candidates) * 30))
+        max_workers = min(6, max(1, len(candidates)))
+        completed = 0
+        with ThreadPoolExecutor(max_workers=max_workers) as executor:
+            futures = [executor.submit(enrich_candidate_fast, c, spy_df) for c in candidates]
+            for fut in as_completed(futures):
+                try:
+                    enriched.append(fut.result())
+                except Exception:
+                    pass
+                completed += 1
+                progress.progress(62 + int(completed / len(candidates) * 30))
 
         # Backtest as filter-lite: do not eliminate aggressively, but poor history lowers ranking.
         results = sorted(enriched, key=lambda x: x["score"], reverse=True)[:5]
